@@ -1,0 +1,29 @@
+{
+  "description": "8-node Core-Edge mesh. Nodes 3-6 form a fully-interconnected core; nodes 1, 2, 7, 8 are edges, each with two redundant uplinks into the core for path diversity.",
+  "nodes": [
+    { "id": 1, "port": 8001, "role": "edge" },
+    { "id": 2, "port": 8002, "role": "edge" },
+    { "id": 3, "port": 8003, "role": "core" },
+    { "id": 4, "port": 8004, "role": "core" },
+    { "id": 5, "port": 8005, "role": "core" },
+    { "id": 6, "port": 8006, "role": "core" },
+    { "id": 7, "port": 8007, "role": "edge" },
+    { "id": 8, "port": 8008, "role": "edge" }
+  ],
+  "edges": [
+    { "from": 3, "to": 4 },
+    { "from": 3, "to": 5 },
+    { "from": 3, "to": 6 },
+    { "from": 4, "to": 5 },
+    { "from": 4, "to": 6 },
+    { "from": 5, "to": 6 },
+    { "from": 1, "to": 3 },
+    { "from": 1, "to": 4 },
+    { "from": 2, "to": 5 },
+    { "from": 2, "to": 6 },
+    { "from": 7, "to": 3 },
+    { "from": 7, "to": 5 },
+    { "from": 8, "to": 4 },
+    { "from": 8, "to": 6 }
+  ]
+}
