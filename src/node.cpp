@@ -7,9 +7,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <queue>
 
-static constexpr int    MAX_PAYLOAD = 1024;
-static constexpr int    BASE10      = 10;
+#include "packet.h"
+
+using netshield::Packet;
+
+static constexpr int BASE10 = 10;
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
@@ -19,7 +23,7 @@ int main(int argc, char* argv[]) {
 
     const int port = static_cast<int>(std::strtol(argv[1], nullptr, BASE10));
     if (port <= 0 || port > 65535) {
-        std::fprintf(stderr, "Error: port must be in range 1–65535\n");
+        std::fprintf(stderr, "Error: port must be in range 1-65535\n");
         return EXIT_FAILURE;
     }
 
@@ -54,11 +58,19 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    std::printf("[node] Listening on UDP port %d\n", port);
+    std::printf("[node] Listening on UDP port %d (expecting %zu-byte Packet frames)\n",
+                port, sizeof(Packet));
     std::fflush(stdout);
 
-    // Stack-allocated receive buffer — preferred for low-latency packet processing.
-    char buf[MAX_PAYLOAD];
+    // Stack-allocated receive buffer sized exactly to the wire format.
+    // Reading into a char[] lets us safely reinterpret_cast to Packet*: the
+    // C++ aliasing rules explicitly permit inspecting any object through a
+    // char/unsigned char pointer.
+    alignas(Packet) char buf[sizeof(Packet)];
+
+    // In-memory packet queue. Single-threaded for this milestone; a lock-free
+    // SPSC variant lands when the worker thread is introduced.
+    std::queue<Packet> packet_queue;
 
     // --- recvfrom() loop ----------------------------------------------------
     // Blocks the thread in the kernel wait queue until a datagram arrives.
@@ -70,7 +82,7 @@ int main(int argc, char* argv[]) {
         const ssize_t bytes = ::recvfrom(
             sockfd,
             buf,
-            sizeof(buf) - 1,
+            sizeof(buf),
             0,
             reinterpret_cast<sockaddr*>(&sender_addr),
             &sender_len
@@ -81,17 +93,58 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        buf[bytes] = '\0';  // null-terminate for safe printf
+        // Length validation BEFORE casting. A short read would let us read
+        // uninitialized stack bytes; an oversized datagram means the sender
+        // is speaking a different protocol version. Drop either case.
+        if (static_cast<std::size_t>(bytes) != sizeof(Packet)) {
+            char sender_ip[INET_ADDRSTRLEN];
+            ::inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
+            std::fprintf(stderr,
+                         "[node] dropped malformed datagram from %s:%d (%zd bytes, expected %zu)\n",
+                         sender_ip,
+                         ntohs(sender_addr.sin_port),
+                         bytes,
+                         sizeof(Packet));
+            continue;
+        }
+
+        // Safe reinterpret: buf is char[] with Packet alignment and matching size.
+        const Packet* wire = reinterpret_cast<const Packet*>(buf);
+
+        // Decode wire (network byte order) into a host-order copy. We copy by
+        // value into the queue so the next recvfrom() can overwrite buf.
+        Packet pkt{};
+        pkt.packet_id      = ntohl(wire->packet_id);
+        pkt.source_node_id = ntohs(wire->source_node_id);
+        pkt.dest_node_id   = ntohs(wire->dest_node_id);
+        pkt.type           = wire->type;  // single byte: no conversion needed
+        pkt.payload_len    = ntohs(wire->payload_len);
+
+        // Guard against a sender claiming a payload_len larger than the buffer.
+        if (pkt.payload_len > netshield::PAYLOAD_SIZE) {
+            std::fprintf(stderr,
+                         "[node] dropped packet id=%u: payload_len=%u exceeds capacity=%zu\n",
+                         pkt.packet_id,
+                         pkt.payload_len,
+                         netshield::PAYLOAD_SIZE);
+            continue;
+        }
+        std::memcpy(pkt.payload, wire->payload, pkt.payload_len);
 
         char sender_ip[INET_ADDRSTRLEN];
         ::inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
 
-        std::printf("[node] %s:%d -> \"%s\" (%zd bytes)\n",
+        std::printf("[node] rx from %s:%d  id=%u  src=%u  dst=%u  type=%u  payload_len=%u\n",
                     sender_ip,
                     ntohs(sender_addr.sin_port),
-                    buf,
-                    bytes);
+                    pkt.packet_id,
+                    pkt.source_node_id,
+                    pkt.dest_node_id,
+                    static_cast<unsigned>(pkt.type),
+                    pkt.payload_len);
         std::fflush(stdout);
+
+        packet_queue.push(pkt);
     }
 
     ::close(sockfd);
