@@ -47,13 +47,15 @@ def load_topology(path: Path) -> Topology:
     return Topology(nodes=nodes, edges=edges)
 
 
-def spawn_node(node: NodeConfig, binary: Path) -> subprocess.Popen[bytes]:
+def spawn_node(
+    node: NodeConfig, binary: Path, topology_path: Path
+) -> subprocess.Popen[bytes]:
     # start_new_session=True calls setsid() in the child after fork, placing
     # it in its own process group. Without this, a terminal Ctrl+C broadcasts
     # SIGINT to every member of the foreground group and the children would
     # die before this control plane could orchestrate the shutdown.
     return subprocess.Popen(
-        [str(binary), str(node.port)],
+        [str(binary), str(node.id), str(topology_path)],
         start_new_session=True,
     )
 
@@ -120,7 +122,7 @@ def main() -> int:
     processes: list[tuple[NodeConfig, subprocess.Popen[bytes]]] = []
     try:
         for node in topology.nodes:
-            proc = spawn_node(node, NODE_BINARY)
+            proc = spawn_node(node, NODE_BINARY, TOPOLOGY_PATH)
             processes.append((node, proc))
             print(
                 f"[ctl] spawned id={node.id} role={node.role:<4} "
