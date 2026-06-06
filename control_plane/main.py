@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
 from typing import IO
@@ -20,10 +21,22 @@ REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 NODE_BINARY: Path = REPO_ROOT / "bin" / "node"
 TOPOLOGY_PATH: Path = REPO_ROOT / "config" / "topology.json"
 LOG_DIR: Path = Path("/tmp/netshield")
+LOGS_DIR: Path = REPO_ROOT / "logs"
+ANOMALY_SNAPSHOT_PATH: Path = LOGS_DIR / "anomaly_snapshot.json"
 SHUTDOWN_GRACE_SECONDS: float = 5.0
 TELEMETRY_PORT: int = 9000
 DASHBOARD_REFRESH_SECONDS: float = 2.0
 HEARTBEAT_STALE_SECONDS: float = 3.0
+
+# Per-node queue length that, when strictly exceeded, is treated as a DDoS
+# signal worth snapshotting. Set well above steady-state burst depth so legit
+# traffic spikes do not trip it.
+QUEUE_ANOMALY_THRESHOLD: int = 10_000
+
+# When a fresh anomaly is detected, the dashboard freezes the warning banner
+# for this many seconds before resuming normal refresh, so the operator can
+# read the alert before it scrolls past.
+ANOMALY_PAUSE_SECONDS: float = 5.0
 
 # Wire format — mirrors src/packet.h. Must stay in sync with the C++ side.
 PACKET_FMT: str = "!IHHBH512s"
@@ -38,6 +51,9 @@ _RED: str = "\033[31m" if _USE_COLOR else ""
 _GREEN: str = "\033[32m" if _USE_COLOR else ""
 _YELLOW: str = "\033[33m" if _USE_COLOR else ""
 _DIM: str = "\033[2m" if _USE_COLOR else ""
+_BOLD: str = "\033[1m" if _USE_COLOR else ""
+_WHITE: str = "\033[97m" if _USE_COLOR else ""
+_BG_RED: str = "\033[41m" if _USE_COLOR else ""
 _RESET: str = "\033[0m" if _USE_COLOR else ""
 
 
@@ -75,6 +91,120 @@ class SpawnedNode:
     config: NodeConfig
     process: subprocess.Popen[bytes]
     log_file: IO[str]
+
+
+@dataclass(frozen=True)
+class AnomalyAlert:
+    node_id: int
+    queue_size: int
+    threshold: int
+    detected_at_iso: str
+    snapshot_path: Path
+
+
+class AnomalyDetector:
+    """Watches heartbeats for queue overflow; snapshots full state once per attack.
+
+    State machine: starts "armed". On the first heartbeat whose queue_size
+    strictly exceeds the threshold, it dumps a full topology+telemetry JSON to
+    `snapshot_path` and disarms. It re-arms only when every observed queue has
+    subsided to threshold-or-below, so a single sustained attack produces a
+    single snapshot rather than one per refresh tick.
+    """
+
+    def __init__(self, threshold: int, snapshot_path: Path) -> None:
+        self._threshold = threshold
+        self._snapshot_path = snapshot_path
+        self._armed: bool = True
+        self._last_alert: AnomalyAlert | None = None
+        self._fresh: bool = False
+
+    @property
+    def last_alert(self) -> AnomalyAlert | None:
+        return self._last_alert
+
+    def consume_fresh(self) -> bool:
+        """Returns True exactly once after each new detection, then resets."""
+        was_fresh = self._fresh
+        self._fresh = False
+        return was_fresh
+
+    def check(
+        self,
+        topology: Topology,
+        heartbeats: dict[int, Heartbeat],
+    ) -> None:
+        if not heartbeats:
+            return
+
+        offenders = [
+            hb for hb in heartbeats.values() if hb.queue_size > self._threshold
+        ]
+        if not offenders:
+            # All queues within tolerance — re-arm for the NEXT attack.
+            self._armed = True
+            return
+
+        if not self._armed:
+            return  # same attack, already captured
+
+        worst = max(offenders, key=lambda hb: hb.queue_size)
+        self._last_alert = self._write_snapshot(topology, heartbeats, worst)
+        self._armed = False
+        self._fresh = True
+
+    def _write_snapshot(
+        self,
+        topology: Topology,
+        heartbeats: dict[int, Heartbeat],
+        worst: Heartbeat,
+    ) -> AnomalyAlert:
+        now_wall = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        snapshot = {
+            "detected_at": now_wall.isoformat(),
+            "trigger": {
+                "node_id": worst.node_id,
+                "queue_size": worst.queue_size,
+                "threshold": self._threshold,
+            },
+            "topology": {
+                "nodes": [
+                    {"id": n.id, "port": n.port, "role": n.role}
+                    for n in topology.nodes
+                ],
+                "edges": [
+                    {"from": e.src, "to": e.dst} for e in topology.edges
+                ],
+            },
+            "telemetry": {
+                str(hb.node_id): {
+                    "queue_size": hb.queue_size,
+                    "delivered": hb.delivered,
+                    "forwarded": hb.forwarded,
+                    "dropped": hb.dropped,
+                    "age_seconds": round(now_mono - hb.received_at, 2),
+                }
+                for hb in heartbeats.values()
+            },
+        }
+
+        # Atomic write: stage to .tmp, then rename. Guarantees a downstream
+        # AI consumer never reads a half-written JSON document — POSIX rename
+        # within the same filesystem is atomic.
+        self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._snapshot_path.with_suffix(self._snapshot_path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+        tmp.replace(self._snapshot_path)
+
+        return AnomalyAlert(
+            node_id=worst.node_id,
+            queue_size=worst.queue_size,
+            threshold=self._threshold,
+            detected_at_iso=now_wall.isoformat(),
+            snapshot_path=self._snapshot_path,
+        )
 
 
 def load_topology(path: Path) -> Topology:
@@ -181,13 +311,32 @@ class TelemetryReceiver:
                     self._heartbeats[hb.node_id] = hb
 
 
+def _render_anomaly_banner(alert: AnomalyAlert) -> None:
+    label = f"{_BG_RED}{_BOLD}{_WHITE}"
+    bar = "=" * 84
+    line1 = (
+        f" [!! ANOMALY !!] DDoS DETECTED — node {alert.node_id} "
+        f"queue={alert.queue_size:,} > threshold={alert.threshold:,}"
+    )
+    line2 = (
+        f" snapshot saved: {alert.snapshot_path}   "
+        f"at {alert.detected_at_iso}"
+    )
+    print(f"{label}{bar}{_RESET}")
+    print(f"{label}{line1.ljust(84)}{_RESET}")
+    print(f"{label}{line2.ljust(84)}{_RESET}")
+    print(f"{label}{bar}{_RESET}")
+
+
 def render_dashboard(
     topology: Topology,
     nodes: list[SpawnedNode],
     telemetry: TelemetryReceiver,
+    detector: AnomalyDetector,
 ) -> None:
     sys.stdout.write(_CLEAR_SCREEN)
     snap = telemetry.snapshot()
+    detector.check(topology, snap)
     now = time.monotonic()
 
     print("NetShield Control Plane")
@@ -196,6 +345,10 @@ def render_dashboard(
         f"   |   telemetry: udp/{telemetry.port}"
         f"   |   refresh: {DASHBOARD_REFRESH_SECONDS:.0f}s"
     )
+
+    if detector.last_alert is not None:
+        _render_anomaly_banner(detector.last_alert)
+
     print("-" * 84)
     print(
         f"  {'ID':>2}  {'Role':<5} {'Port':>5} {'PID':>6}   "
@@ -210,7 +363,12 @@ def render_dashboard(
             queue_s = delivered_s = forwarded_s = dropped_s = "-"
             hb_cell = f"{_YELLOW}no data{_RESET}"
         else:
-            queue_s = str(hb.queue_size)
+            over = hb.queue_size > QUEUE_ANOMALY_THRESHOLD
+            queue_s = (
+                f"{_RED}{_BOLD}{hb.queue_size}{_RESET}"
+                if over
+                else str(hb.queue_size)
+            )
             delivered_s = str(hb.delivered)
             forwarded_s = str(hb.forwarded)
             dropped_s = str(hb.dropped)
@@ -318,6 +476,13 @@ def main() -> int:
     telemetry.start()
     print(f"[ctl] telemetry receiver bound to udp/{TELEMETRY_PORT}", flush=True)
 
+    detector = AnomalyDetector(QUEUE_ANOMALY_THRESHOLD, ANOMALY_SNAPSHOT_PATH)
+    print(
+        f"[ctl] anomaly detector armed: queue > {QUEUE_ANOMALY_THRESHOLD:,} "
+        f"→ snapshot to {ANOMALY_SNAPSHOT_PATH}",
+        flush=True,
+    )
+
     nodes: list[SpawnedNode] = []
     try:
         for cfg in topology.nodes:
@@ -336,8 +501,15 @@ def main() -> int:
             return 0
 
         while not _shutdown_event.is_set():
-            render_dashboard(topology, nodes, telemetry)
-            _shutdown_event.wait(DASHBOARD_REFRESH_SECONDS)
+            render_dashboard(topology, nodes, telemetry, detector)
+            # On a fresh anomaly, hold the banner on-screen longer than a normal
+            # refresh tick so the operator is guaranteed to see it.
+            pause = (
+                ANOMALY_PAUSE_SECONDS
+                if detector.consume_fresh()
+                else DASHBOARD_REFRESH_SECONDS
+            )
+            _shutdown_event.wait(pause)
     finally:
         telemetry.stop()
         shutdown(nodes)
