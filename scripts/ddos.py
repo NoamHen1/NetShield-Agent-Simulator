@@ -35,17 +35,17 @@ STATUS_INTERVAL: int = 10_000
 TOPOLOGY_PATH = Path(__file__).parent.parent / "config" / "topology.json"
 
 
-def load_attacker_port(topology_path: Path, attacker_id: int) -> int:
+def load_node_port(topology_path: Path, node_id: int) -> int:
     with topology_path.open() as f:
         topology = json.load(f)
 
     for node in topology["nodes"]:
-        if node["id"] == attacker_id:
+        if node["id"] == node_id:
             return int(node["port"])
 
     known_ids = [n["id"] for n in topology["nodes"]]
     print(
-        f"[error] Node {attacker_id} not found in topology. "
+        f"[error] Node {node_id} not found in topology. "
         f"Known IDs: {known_ids}",
         file=sys.stderr,
     )
@@ -75,11 +75,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    attacker_port = load_attacker_port(TOPOLOGY_PATH, args.attacker)
+    attacker_port = load_node_port(TOPOLOGY_PATH, args.attacker)
+    target_port = load_node_port(TOPOLOGY_PATH, args.target)
 
     print(
         f"[ddos] Flooding node {args.attacker} (port {attacker_port}) "
-        f"→ target node {args.target}"
+        f"→ target node {args.target} (port {target_port})"
     )
     print("[ddos] Press Ctrl+C to stop.\n")
 
