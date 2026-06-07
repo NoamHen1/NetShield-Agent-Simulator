@@ -83,12 +83,17 @@ struct NodeState {
 //     reflect sustained load.
 void application_loop(NodeState& state) {
     while (true) {
-        std::this_thread::sleep_for(APPLICATION_DRAIN_INTERVAL);
+        // 1. Sleep OUTSIDE the lock so we don't freeze the router.
+        // 10ms sleep × 50 packets/batch = 5,000 pkts/sec drain rate,
+        // fast enough to clear a post-attack target-node backlog promptly.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+        // 2. Lock and pop a STRICT maximum of 50 packets
         std::lock_guard<std::mutex> lock(state.mtx);
-        for (std::size_t i = 0; i < APPLICATION_DRAIN_BATCH; ++i) {
-            if (state.packet_queue.empty()) break;
+        int popped = 0;
+        while (!state.packet_queue.empty() && popped < 50) {
             state.packet_queue.pop();
+            popped++;
         }
     }
 }
@@ -310,13 +315,35 @@ int main(int argc, char* argv[]) {
 
             int block_id = -1;
             if (std::sscanf(body, "BLOCK:%d", &block_id) == 1 && block_id > 0) {
+                std::uint64_t purged = 0;
                 {
                     std::lock_guard<std::mutex> lock(state.mtx);
                     state.blocked_sources.insert(block_id);
+
+                    // Active Queue Purging: std::queue has no erase(), so we
+                    // rebuild it by popping every element into a clean temp
+                    // queue, discarding any packet whose source matches the
+                    // newly-blocked ID. This is O(N) but happens once per
+                    // CONTROL packet — latency here beats letting megabytes of
+                    // attack traffic linger in memory until the consumer drains.
+                    std::queue<Packet> clean;
+                    while (!state.packet_queue.empty()) {
+                        Packet p = state.packet_queue.front();
+                        state.packet_queue.pop();
+                        if (static_cast<int>(p.source_node_id) == block_id) {
+                            ++purged;
+                            ++state.dropped;
+                        } else {
+                            clean.push(std::move(p));
+                        }
+                    }
+                    state.packet_queue = std::move(clean);
                 }
                 std::printf(
-                    "[node %d] ENFORCING FIREWALL: Dropping all traffic from node %d\n",
-                    node_id, block_id);
+                    "[node %d] ENFORCING FIREWALL: node %d blocked, "
+                    "purged %llu queued packets\n",
+                    node_id, block_id,
+                    static_cast<unsigned long long>(purged));
                 std::fflush(stdout);
             } else {
                 std::fprintf(stderr,

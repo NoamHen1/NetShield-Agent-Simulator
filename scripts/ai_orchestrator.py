@@ -30,12 +30,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 DEFAULT_SNAPSHOT: Path = REPO_ROOT / "logs" / "anomaly_snapshot.json"
 DEFAULT_MODEL: str = "gemini-2.5-flash"
+FALLBACK_MODEL: str = "gemini-1.5-flash"
 
 
 class MitigationStrategy(BaseModel):
@@ -142,13 +144,22 @@ def run_analyzer(
         "TELEMETRY SNAPSHOT (JSON):\n"
         f"{json.dumps(snapshot, indent=2)}"
     )
-    response = client.models.generate_content(
-        model=model,
-        contents=user_payload,
-        config=types.GenerateContentConfig(
-            system_instruction=ANALYZER_SYSTEM_PROMPT,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=ANALYZER_SYSTEM_PROMPT,
     )
+    try:
+        response = client.models.generate_content(
+            model=model, contents=user_payload, config=config
+        )
+    except genai_errors.ServerError as exc:
+        print(
+            f"[orchestrator] WARNING: {model} unavailable ({exc}) "
+            f"— retrying with {FALLBACK_MODEL}",
+            file=sys.stderr,
+        )
+        response = client.models.generate_content(
+            model=FALLBACK_MODEL, contents=user_payload, config=config
+        )
     return response.text or ""
 
 
@@ -164,15 +175,24 @@ def run_strategist(
         "ORIGINAL SNAPSHOT (for authoritative node IDs and roles):\n"
         f"{json.dumps(snapshot, indent=2)}"
     )
-    response = client.models.generate_content(
-        model=model,
-        contents=user_payload,
-        config=types.GenerateContentConfig(
-            system_instruction=STRATEGIST_SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=MitigationStrategy,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=STRATEGIST_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=MitigationStrategy,
     )
+    try:
+        response = client.models.generate_content(
+            model=model, contents=user_payload, config=config
+        )
+    except genai_errors.ServerError as exc:
+        print(
+            f"[orchestrator] WARNING: {model} unavailable ({exc}) "
+            f"— retrying with {FALLBACK_MODEL}",
+            file=sys.stderr,
+        )
+        response = client.models.generate_content(
+            model=FALLBACK_MODEL, contents=user_payload, config=config
+        )
     # Constrained decoding guarantees response.parsed is a MitigationStrategy.
     # The fallback path covers SDK edge cases where .parsed is None despite a
     # valid response.text.

@@ -16,6 +16,7 @@ import json
 import socket
 import struct
 import sys
+import time
 from pathlib import Path
 
 # Wire format mirrors netshield::Packet from src/packet.h.
@@ -90,20 +91,23 @@ def main() -> None:
 
     try:
         while True:
-            datagram = struct.pack(
-                PACKET_FORMAT,
-                packet_id & 0xFFFF_FFFF,
-                args.attacker,
-                args.target,
-                PACKET_TYPE_DATA,
-                PAYLOAD_LEN,
-                PAYLOAD.ljust(512, b"\x00"),
-            )
-            sock.sendto(datagram, dest)
-            packet_id += 1
+            for _ in range(500):
+                datagram = struct.pack(
+                    PACKET_FORMAT,
+                    packet_id & 0xFFFF_FFFF,
+                    args.attacker,
+                    args.target,
+                    PACKET_TYPE_DATA,
+                    PAYLOAD_LEN,
+                    PAYLOAD.ljust(512, b"\x00"),
+                )
+                sock.sendto(datagram, dest)
+                packet_id += 1
 
-            if packet_id % STATUS_INTERVAL == 0:
-                print(f"[ddos] Flooded {packet_id // 1000}k packets...")
+                if packet_id % STATUS_INTERVAL == 0:
+                    print(f"[ddos] Flooded {packet_id // 1000}k packets...")
+
+            time.sleep(0.05)
     except KeyboardInterrupt:
         print(f"\n[ddos] Stopped. Total packets sent: {packet_id:,}")
     finally:
