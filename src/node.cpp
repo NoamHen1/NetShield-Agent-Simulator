@@ -29,6 +29,14 @@ using netshield::PacketType;
 static constexpr int  BASE10              = 10;
 static constexpr auto HEARTBEAT_INTERVAL  = std::chrono::seconds(1);
 
+// Application consumer cadence. The sleep simulates real per-packet
+// processing time, keeping the queue depth a meaningful load signal rather
+// than letting it drain instantly. The batch caps how many packets a single
+// critical section pops, so the producer (recv loop) isn't starved if the
+// queue is deep.
+static constexpr auto APPLICATION_DRAIN_INTERVAL = std::chrono::milliseconds(5);
+static constexpr std::size_t APPLICATION_DRAIN_BATCH = 1000;
+
 namespace {
 
 sockaddr_in make_loopback_addr(int port) {
@@ -56,6 +64,34 @@ struct NodeState {
     // hot path. Guarded by `mtx` like everything else in NodeState.
     std::unordered_set<int> blocked_sources;
 };
+
+// Application consumer thread — drains state.packet_queue at a bounded rate.
+//
+// Closes the producer/consumer loop: without it the recv loop pushes to a
+// queue nothing ever pops, so queue_size grows monotonically and any
+// downstream state machine that re-arms on "queue subsided" (e.g. the Python
+// AnomalyDetector) gets stuck forever after a single attack.
+//
+// Design notes:
+//   * One mutex acquisition per drain cycle, batched up to APPLICATION_DRAIN_BATCH
+//     pops. Acquiring per-packet would dominate the cost; batching amortizes it.
+//   * The critical section does only O(N) pops on a std::queue (no I/O, no
+//     allocations beyond what pop frees), so the producer is never blocked
+//     for long even at peak depth.
+//   * The sleep models real application work between batches. Without it the
+//     consumer would drain instantly and queue_size would never meaningfully
+//     reflect sustained load.
+void application_loop(NodeState& state) {
+    while (true) {
+        std::this_thread::sleep_for(APPLICATION_DRAIN_INTERVAL);
+
+        std::lock_guard<std::mutex> lock(state.mtx);
+        for (std::size_t i = 0; i < APPLICATION_DRAIN_BATCH; ++i) {
+            if (state.packet_queue.empty()) break;
+            state.packet_queue.pop();
+        }
+    }
+}
 
 void telemetry_loop(int node_id, int telemetry_port, NodeState& state) {
     const int sockfd = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -216,10 +252,13 @@ int main(int argc, char* argv[]) {
 
     NodeState state;
 
-    // Spawn the heartbeat thread. detach() because we never join — the
-    // process is signal-killed by the control plane on shutdown, taking
-    // every thread with it.
+    // Spawn the heartbeat + application-consumer threads. detach() because
+    // we never join — the process is signal-killed by the control plane on
+    // shutdown, taking every thread with it. The consumer is what keeps
+    // queue_size a meaningful load signal: without it, heartbeats would
+    // report monotonically growing queue depth forever.
     std::thread(telemetry_loop, node_id, telemetry_port, std::ref(state)).detach();
+    std::thread(application_loop, std::ref(state)).detach();
 
     alignas(Packet) char buf[sizeof(Packet)];
 
