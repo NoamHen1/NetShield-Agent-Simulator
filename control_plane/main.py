@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import socket
 import struct
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import IO
+from typing import IO, Any
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 NODE_BINARY: Path = REPO_ROOT / "bin" / "node"
@@ -41,7 +42,17 @@ ANOMALY_PAUSE_SECONDS: float = 5.0
 # Wire format — mirrors src/packet.h. Must stay in sync with the C++ side.
 PACKET_FMT: str = "!IHHBH512s"
 PACKET_SIZE: int = struct.calcsize(PACKET_FMT)
+PACKET_TYPE_DATA: int = 0
+PACKET_TYPE_CONTROL: int = 1
 PACKET_TYPE_HEARTBEAT: int = 2
+
+# Sentinel source_node_id for control-plane-originated CONTROL packets. Real
+# nodes are 1..N; 0 is reserved as "control plane" so logs can distinguish.
+CONTROL_PLANE_NODE_ID: int = 0
+
+# Default Gemini model used by the AI worker. Kept here so the only place to
+# bump versions is the control plane configuration block.
+GEMINI_MODEL: str = "gemini-2.5-flash"
 
 # ANSI escapes. Used for clear-screen and stale-cell highlighting in the
 # dashboard. Auto-suppressed when stdout is not a TTY.
@@ -102,22 +113,64 @@ class AnomalyAlert:
     snapshot_path: Path
 
 
+def _build_control_packet(seq: int, dest_node_id: int, block_id: int) -> bytes:
+    """Pack a BLOCK:<id> CONTROL datagram in the C++ Packet wire format.
+
+    source_node_id is the CONTROL_PLANE sentinel (0). dest_node_id is
+    informational only — the actual recipient is determined by the UDP
+    destination address; the field exists so node logs can record intent.
+    """
+    payload = f"BLOCK:{block_id}".encode("ascii")
+    return struct.pack(
+        PACKET_FMT,
+        seq & 0xFFFF_FFFF,
+        CONTROL_PLANE_NODE_ID,
+        dest_node_id & 0xFFFF,
+        PACKET_TYPE_CONTROL,
+        len(payload),
+        payload.ljust(512, b"\0"),
+    )
+
+
 class AnomalyDetector:
-    """Watches heartbeats for queue overflow; snapshots full state once per attack.
+    """Watches heartbeats for queue overflow; snapshots state and drives AI mitigation.
 
     State machine: starts "armed". On the first heartbeat whose queue_size
-    strictly exceeds the threshold, it dumps a full topology+telemetry JSON to
-    `snapshot_path` and disarms. It re-arms only when every observed queue has
-    subsided to threshold-or-below, so a single sustained attack produces a
-    single snapshot rather than one per refresh tick.
+    strictly exceeds the threshold, it (1) writes a topology+telemetry JSON
+    snapshot, (2) spawns a background AI worker thread to call the Gemini
+    pipeline and inject CONTROL packets, and (3) disarms. Re-arms only when
+    every queue is back within tolerance AND the AI worker is no longer busy,
+    so one attack produces exactly one analysis + one enforcement cycle.
+
+    The dashboard thread reads AI state via ai_status_for_display(); the
+    worker thread writes via _ai_lock. All shared state is guarded.
     """
 
-    def __init__(self, threshold: int, snapshot_path: Path) -> None:
+    def __init__(
+        self,
+        threshold: int,
+        snapshot_path: Path,
+        topology: Topology,
+    ) -> None:
         self._threshold = threshold
         self._snapshot_path = snapshot_path
+        self._port_by_id: dict[int, int] = {
+            n.id: n.port for n in topology.nodes
+        }
         self._armed: bool = True
         self._last_alert: AnomalyAlert | None = None
         self._fresh: bool = False
+
+        # AI worker state — guarded by _ai_lock so the dashboard thread can
+        # read it without racing the worker.
+        self._ai_lock = threading.Lock()
+        self._ai_state: str = "idle"  # idle | analyzing | done | failed
+        self._ai_started_at: float | None = None  # monotonic
+        self._ai_finished_at: float | None = None
+        self._ai_strategy: Any = None  # MitigationStrategy (lazy import)
+        self._ai_error: str | None = None
+        self._ai_enforced_cores: list[int] | None = None
+        self._ai_thread: threading.Thread | None = None
 
     @property
     def last_alert(self) -> AnomalyAlert | None:
@@ -128,6 +181,21 @@ class AnomalyDetector:
         was_fresh = self._fresh
         self._fresh = False
         return was_fresh
+
+    def ai_status_for_display(self) -> dict[str, Any]:
+        """Thread-safe read of the AI worker state for the dashboard."""
+        with self._ai_lock:
+            elapsed: float | None = None
+            if self._ai_started_at is not None:
+                end = self._ai_finished_at or time.monotonic()
+                elapsed = end - self._ai_started_at
+            return {
+                "state": self._ai_state,
+                "elapsed": elapsed,
+                "strategy": self._ai_strategy,
+                "error": self._ai_error,
+                "enforced_cores": self._ai_enforced_cores,
+            }
 
     def check(
         self,
@@ -140,28 +208,36 @@ class AnomalyDetector:
         offenders = [
             hb for hb in heartbeats.values() if hb.queue_size > self._threshold
         ]
+        with self._ai_lock:
+            ai_busy = self._ai_state == "analyzing"
+
         if not offenders:
-            # All queues within tolerance — re-arm for the NEXT attack.
-            self._armed = True
+            # Only re-arm when AI is also idle — otherwise we'd risk firing a
+            # new analysis before the current one finishes mitigating.
+            if not ai_busy:
+                self._armed = True
             return
 
         if not self._armed:
             return  # same attack, already captured
 
         worst = max(offenders, key=lambda hb: hb.queue_size)
-        self._last_alert = self._write_snapshot(topology, heartbeats, worst)
+        snapshot_dict, alert = self._snapshot(topology, heartbeats, worst)
+        self._last_alert = alert
         self._armed = False
         self._fresh = True
+        self._spawn_ai_worker(snapshot_dict)
 
-    def _write_snapshot(
+    def _snapshot(
         self,
         topology: Topology,
         heartbeats: dict[int, Heartbeat],
         worst: Heartbeat,
-    ) -> AnomalyAlert:
+    ) -> tuple[dict[str, Any], AnomalyAlert]:
+        """Builds the snapshot dict in memory AND writes it to disk atomically."""
         now_wall = datetime.now(timezone.utc)
         now_mono = time.monotonic()
-        snapshot = {
+        snapshot: dict[str, Any] = {
             "detected_at": now_wall.isoformat(),
             "trigger": {
                 "node_id": worst.node_id,
@@ -198,13 +274,100 @@ class AnomalyDetector:
             json.dump(snapshot, f, indent=2)
         tmp.replace(self._snapshot_path)
 
-        return AnomalyAlert(
+        alert = AnomalyAlert(
             node_id=worst.node_id,
             queue_size=worst.queue_size,
             threshold=self._threshold,
             detected_at_iso=now_wall.isoformat(),
             snapshot_path=self._snapshot_path,
         )
+        return snapshot, alert
+
+    # ------------------------------------------------------------------------
+    # AI worker — background thread keeps the dashboard responsive while the
+    # LLM round trip (seconds) and CONTROL-packet fan-out run asynchronously.
+    # ------------------------------------------------------------------------
+    def _spawn_ai_worker(self, snapshot_dict: dict[str, Any]) -> None:
+        with self._ai_lock:
+            self._ai_state = "analyzing"
+            self._ai_started_at = time.monotonic()
+            self._ai_finished_at = None
+            self._ai_strategy = None
+            self._ai_error = None
+            self._ai_enforced_cores = None
+        t = threading.Thread(
+            target=self._ai_worker,
+            args=(snapshot_dict,),
+            daemon=True,
+            name="ai-worker",
+        )
+        t.start()
+        self._ai_thread = t
+
+    def _ai_worker(self, snapshot_dict: dict[str, Any]) -> None:
+        try:
+            # Lazy import — keep google-genai a soft dependency. The control
+            # plane stays runnable even when AI deps aren't installed; only
+            # the worker fails with a clear "failed" state in that case.
+            scripts_dir = REPO_ROOT / "scripts"
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from ai_orchestrator import (  # type: ignore[import-not-found]
+                run_analyzer,
+                run_strategist,
+            )
+            from google import genai  # type: ignore[import-not-found]
+
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "GEMINI_API_KEY not set in control-plane environment"
+                )
+
+            client = genai.Client(api_key=api_key)
+            analysis = run_analyzer(client, GEMINI_MODEL, snapshot_dict)
+            strategy = run_strategist(
+                client, GEMINI_MODEL, snapshot_dict, analysis
+            )
+            enforced = self._enforce_strategy(strategy)
+
+            with self._ai_lock:
+                self._ai_state = "done"
+                self._ai_strategy = strategy
+                self._ai_enforced_cores = enforced
+                self._ai_finished_at = time.monotonic()
+        except Exception as e:  # noqa: BLE001
+            with self._ai_lock:
+                self._ai_state = "failed"
+                self._ai_error = f"{type(e).__name__}: {e}"
+                self._ai_finished_at = time.monotonic()
+
+    def _enforce_strategy(self, strategy: Any) -> list[int]:
+        """Send a BLOCK CONTROL packet to each core node the AI chose.
+
+        Returns the IDs actually contacted (unknown ones are skipped). UDP is
+        fire-and-forget by design: if a CONTROL packet is lost, the next
+        anomaly cycle will simply re-fire it — exactly the property that makes
+        this enforcement pattern scale.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sent_to: list[int] = []
+        try:
+            for seq, core_id in enumerate(strategy.apply_to_core_nodes, start=1):
+                port = self._port_by_id.get(core_id)
+                if port is None:
+                    continue
+                pkt = _build_control_packet(
+                    seq, core_id, strategy.block_source_id
+                )
+                try:
+                    sock.sendto(pkt, ("127.0.0.1", port))
+                    sent_to.append(core_id)
+                except OSError:
+                    pass  # node may have exited; idempotent re-fire on next cycle
+        finally:
+            sock.close()
+        return sent_to
 
 
 def load_topology(path: Path) -> Topology:
@@ -311,20 +474,46 @@ class TelemetryReceiver:
                     self._heartbeats[hb.node_id] = hb
 
 
-def _render_anomaly_banner(alert: AnomalyAlert) -> None:
+def _format_ai_line(ai_status: dict[str, Any]) -> str:
+    state = ai_status["state"]
+    elapsed = ai_status["elapsed"]
+    elapsed_s = f" ({elapsed:.1f}s)" if elapsed is not None else ""
+
+    if state == "idle":
+        return " AI MITIGATION: idle"
+    if state == "analyzing":
+        return f" AI MITIGATION: AI Analyzing...{elapsed_s}"
+    if state == "done":
+        strategy = ai_status["strategy"]
+        cores = ai_status["enforced_cores"] or []
+        if strategy is not None:
+            return (
+                f" AI MITIGATION: {strategy.action} src={strategy.block_source_id}"
+                f" -> CONTROL packets sent to cores {cores}{elapsed_s}"
+            )
+        return f" AI MITIGATION: done{elapsed_s}"
+    if state == "failed":
+        err = ai_status["error"] or "unknown error"
+        return f" AI MITIGATION FAILED{elapsed_s}: {err}"
+    return f" AI MITIGATION: {state}"
+
+
+def _render_anomaly_banner(
+    alert: AnomalyAlert,
+    ai_status: dict[str, Any],
+) -> None:
     label = f"{_BG_RED}{_BOLD}{_WHITE}"
     bar = "=" * 84
     line1 = (
-        f" [!! ANOMALY !!] DDoS DETECTED — node {alert.node_id} "
+        f" [!! ANOMALY !!] DDoS DETECTED -- node {alert.node_id} "
         f"queue={alert.queue_size:,} > threshold={alert.threshold:,}"
     )
-    line2 = (
-        f" snapshot saved: {alert.snapshot_path}   "
-        f"at {alert.detected_at_iso}"
-    )
+    line2 = f" snapshot: {alert.snapshot_path}   at {alert.detected_at_iso}"
+    line3 = _format_ai_line(ai_status)
     print(f"{label}{bar}{_RESET}")
-    print(f"{label}{line1.ljust(84)}{_RESET}")
-    print(f"{label}{line2.ljust(84)}{_RESET}")
+    print(f"{label}{line1.ljust(84)[:84]}{_RESET}")
+    print(f"{label}{line2.ljust(84)[:84]}{_RESET}")
+    print(f"{label}{line3.ljust(84)[:84]}{_RESET}")
     print(f"{label}{bar}{_RESET}")
 
 
@@ -347,7 +536,7 @@ def render_dashboard(
     )
 
     if detector.last_alert is not None:
-        _render_anomaly_banner(detector.last_alert)
+        _render_anomaly_banner(detector.last_alert, detector.ai_status_for_display())
 
     print("-" * 84)
     print(
@@ -476,12 +665,25 @@ def main() -> int:
     telemetry.start()
     print(f"[ctl] telemetry receiver bound to udp/{TELEMETRY_PORT}", flush=True)
 
-    detector = AnomalyDetector(QUEUE_ANOMALY_THRESHOLD, ANOMALY_SNAPSHOT_PATH)
+    detector = AnomalyDetector(
+        QUEUE_ANOMALY_THRESHOLD, ANOMALY_SNAPSHOT_PATH, topology
+    )
     print(
         f"[ctl] anomaly detector armed: queue > {QUEUE_ANOMALY_THRESHOLD:,} "
-        f"→ snapshot to {ANOMALY_SNAPSHOT_PATH}",
+        f"-> snapshot to {ANOMALY_SNAPSHOT_PATH}",
         flush=True,
     )
+    if os.environ.get("GEMINI_API_KEY"):
+        print(
+            f"[ctl] AI mitigation pipeline ready (model: {GEMINI_MODEL})",
+            flush=True,
+        )
+    else:
+        print(
+            "[ctl] GEMINI_API_KEY not set -- AI mitigation will fail when "
+            "an anomaly fires (snapshot will still be written).",
+            flush=True,
+        )
 
     nodes: list[SpawnedNode] = []
     try:
@@ -502,13 +704,15 @@ def main() -> int:
 
         while not _shutdown_event.is_set():
             render_dashboard(topology, nodes, telemetry, detector)
-            # On a fresh anomaly, hold the banner on-screen longer than a normal
-            # refresh tick so the operator is guaranteed to see it.
-            pause = (
-                ANOMALY_PAUSE_SECONDS
-                if detector.consume_fresh()
-                else DASHBOARD_REFRESH_SECONDS
-            )
+            # Default cadence; tightened while the AI worker is running so the
+            # operator can watch the "Analyzing..." elapsed counter tick.
+            ai_state = detector.ai_status_for_display()["state"]
+            if detector.consume_fresh():
+                pause = ANOMALY_PAUSE_SECONDS
+            elif ai_state == "analyzing":
+                pause = 1.0
+            else:
+                pause = DASHBOARD_REFRESH_SECONDS
             _shutdown_event.wait(pause)
     finally:
         telemetry.stop()

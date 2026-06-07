@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,14 @@ using netshield::PacketType;
 
 static constexpr int  BASE10              = 10;
 static constexpr auto HEARTBEAT_INTERVAL  = std::chrono::seconds(1);
+
+// Application consumer cadence. The sleep simulates real per-packet
+// processing time, keeping the queue depth a meaningful load signal rather
+// than letting it drain instantly. The batch caps how many packets a single
+// critical section pops, so the producer (recv loop) isn't starved if the
+// queue is deep.
+static constexpr auto APPLICATION_DRAIN_INTERVAL = std::chrono::milliseconds(5);
+static constexpr std::size_t APPLICATION_DRAIN_BATCH = 1000;
 
 namespace {
 
@@ -49,7 +58,45 @@ struct NodeState {
     std::uint64_t delivered = 0;      // packets terminated at this node
     std::uint64_t forwarded = 0;      // packets handed off to a next hop
     std::uint64_t dropped   = 0;      // packets discarded (no route, malformed, etc.)
+
+    // Dynamic ACL: source_node_ids whose DATA traffic we silently drop. Mutated
+    // only by CONTROL packets from the Python control plane; read O(1) on the
+    // hot path. Guarded by `mtx` like everything else in NodeState.
+    std::unordered_set<int> blocked_sources;
 };
+
+// Application consumer thread — drains state.packet_queue at a bounded rate.
+//
+// Closes the producer/consumer loop: without it the recv loop pushes to a
+// queue nothing ever pops, so queue_size grows monotonically and any
+// downstream state machine that re-arms on "queue subsided" (e.g. the Python
+// AnomalyDetector) gets stuck forever after a single attack.
+//
+// Design notes:
+//   * One mutex acquisition per drain cycle, batched up to APPLICATION_DRAIN_BATCH
+//     pops. Acquiring per-packet would dominate the cost; batching amortizes it.
+//   * The critical section does only O(N) pops on a std::queue (no I/O, no
+//     allocations beyond what pop frees), so the producer is never blocked
+//     for long even at peak depth.
+//   * The sleep models real application work between batches. Without it the
+//     consumer would drain instantly and queue_size would never meaningfully
+//     reflect sustained load.
+void application_loop(NodeState& state) {
+    while (true) {
+        // 1. Sleep OUTSIDE the lock so we don't freeze the router.
+        // 10ms sleep × 50 packets/batch = 5,000 pkts/sec drain rate,
+        // fast enough to clear a post-attack target-node backlog promptly.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // 2. Lock and pop a STRICT maximum of 50 packets
+        std::lock_guard<std::mutex> lock(state.mtx);
+        int popped = 0;
+        while (!state.packet_queue.empty() && popped < 50) {
+            state.packet_queue.pop();
+            popped++;
+        }
+    }
+}
 
 void telemetry_loop(int node_id, int telemetry_port, NodeState& state) {
     const int sockfd = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -210,10 +257,13 @@ int main(int argc, char* argv[]) {
 
     NodeState state;
 
-    // Spawn the heartbeat thread. detach() because we never join — the
-    // process is signal-killed by the control plane on shutdown, taking
-    // every thread with it.
+    // Spawn the heartbeat + application-consumer threads. detach() because
+    // we never join — the process is signal-killed by the control plane on
+    // shutdown, taking every thread with it. The consumer is what keeps
+    // queue_size a meaningful load signal: without it, heartbeats would
+    // report monotonically growing queue depth forever.
     std::thread(telemetry_loop, node_id, telemetry_port, std::ref(state)).detach();
+    std::thread(application_loop, std::ref(state)).detach();
 
     alignas(Packet) char buf[sizeof(Packet)];
 
@@ -244,6 +294,76 @@ int main(int argc, char* argv[]) {
         const std::uint32_t pid  = ntohl(wire->packet_id);
         const std::uint16_t src  = ntohs(wire->source_node_id);
         const std::uint16_t dest = ntohs(wire->dest_node_id);
+
+        // -- CONTROL plane: parse policy update before any data-path work. ----
+        // CONTROL packets carry plain-ASCII policy commands from the Python
+        // control plane, e.g. "BLOCK:1" → add source node 1 to the ACL. Kept
+        // simple-by-design: the channel is loopback-only and the data plane
+        // never originates CONTROL itself.
+        if (wire->type == static_cast<std::uint8_t>(PacketType::CONTROL)) {
+            const std::uint16_t plen = ntohs(wire->payload_len);
+            if (plen == 0 || plen > netshield::PAYLOAD_SIZE) {
+                std::fprintf(stderr,
+                             "[node %d] CONTROL id=%u: bad payload_len=%u\n",
+                             node_id, pid, plen);
+                continue;
+            }
+            // Null-terminated copy so sscanf is safe — payload on the wire is
+            // not guaranteed to be terminated.
+            char body[netshield::PAYLOAD_SIZE + 1] = {0};
+            std::memcpy(body, wire->payload, plen);
+
+            int block_id = -1;
+            if (std::sscanf(body, "BLOCK:%d", &block_id) == 1 && block_id > 0) {
+                std::uint64_t purged = 0;
+                {
+                    std::lock_guard<std::mutex> lock(state.mtx);
+                    state.blocked_sources.insert(block_id);
+
+                    // Active Queue Purging: std::queue has no erase(), so we
+                    // rebuild it by popping every element into a clean temp
+                    // queue, discarding any packet whose source matches the
+                    // newly-blocked ID. This is O(N) but happens once per
+                    // CONTROL packet — latency here beats letting megabytes of
+                    // attack traffic linger in memory until the consumer drains.
+                    std::queue<Packet> clean;
+                    while (!state.packet_queue.empty()) {
+                        Packet p = state.packet_queue.front();
+                        state.packet_queue.pop();
+                        if (static_cast<int>(p.source_node_id) == block_id) {
+                            ++purged;
+                            ++state.dropped;
+                        } else {
+                            clean.push(std::move(p));
+                        }
+                    }
+                    state.packet_queue = std::move(clean);
+                }
+                std::printf(
+                    "[node %d] ENFORCING FIREWALL: node %d blocked, "
+                    "purged %llu queued packets\n",
+                    node_id, block_id,
+                    static_cast<unsigned long long>(purged));
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr,
+                             "[node %d] CONTROL id=%u: unrecognized payload \"%s\"\n",
+                             node_id, pid, body);
+            }
+            continue;
+        }
+
+        // -- ACL gate on the DATA path. ----------------------------------------
+        // O(1) hashset lookup under a brief lock. Performed BEFORE both
+        // delivery and forwarding so a blocked source cannot transit this node
+        // by either path. Silent drop — by design, attackers learn nothing.
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            if (state.blocked_sources.count(static_cast<int>(src)) != 0) {
+                ++state.dropped;
+                continue;
+            }
+        }
 
         if (static_cast<int>(dest) == node_id) {
             Packet pkt{};
