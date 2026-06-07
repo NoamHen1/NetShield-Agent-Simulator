@@ -4,7 +4,7 @@
 #   make                              # build C++ data plane (default)
 #   make install                      # create venv + install Python deps
 #   make run                          # launch control plane (needs GEMINI_API_KEY)
-#   make ddos ATTACKER=1 TARGET=8     # inject a flood
+#   make ddos 1 8                     # inject a flood (attacker=1, target=8)
 #   make ai                           # run orchestrator against latest snapshot
 #   make smoke                        # end-to-end smoke test
 #   make test                         # routing unit test
@@ -39,7 +39,24 @@ NODE_SRC   := $(SRC_DIR)/node.cpp
 NODE_HDRS  := $(wildcard $(SRC_DIR)/*.h)
 NODE_BIN   := $(BIN_DIR)/node
 
-# -- Override on CLI: `make ddos ATTACKER=1 TARGET=8` -------------------------
+# -- DDoS args ----------------------------------------------------------------
+# Two ways to pass attacker/target IDs:
+#   1. Positional:   `make ddos 1 8`
+#   2. Named:        `make ddos ATTACKER=1 TARGET=8`
+#
+# Make normally treats every word on the command line as a target. To support
+# positional args we grab everything after `ddos` from MAKECMDGOALS and define
+# them as empty rules below so make doesn't error with "No rule to make 1".
+ifeq (ddos,$(firstword $(MAKECMDGOALS)))
+  DDOS_POS_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+  ifneq ($(DDOS_POS_ARGS),)
+    ATTACKER := $(word 1,$(DDOS_POS_ARGS))
+    TARGET   := $(word 2,$(DDOS_POS_ARGS))
+    # Silently swallow the positional words as no-op goals.
+    $(eval $(DDOS_POS_ARGS):;@:)
+  endif
+endif
+
 ATTACKER   ?= 1
 TARGET     ?= 8
 
@@ -80,7 +97,7 @@ deps: install  ## Alias for `install`
 run: $(NODE_BIN) $(INSTALL_STAMP)  ## Launch the control plane (Ctrl+C to stop)
 	$(VENV_PY) $(CTL_DIR)/main.py
 
-ddos: $(INSTALL_STAMP)  ## Run DDoS flood: make ddos ATTACKER=<id> TARGET=<id>
+ddos: $(INSTALL_STAMP)  ## Run DDoS flood: `make ddos <attacker> <target>`
 	$(VENV_PY) $(SCRIPT_DIR)/ddos.py --attacker $(ATTACKER) --target $(TARGET)
 
 ai: $(INSTALL_STAMP)  ## Run AI orchestrator against logs/anomaly_snapshot.json
