@@ -27,6 +27,11 @@ ANOMALY_SNAPSHOT_PATH: Path = LOGS_DIR / "anomaly_snapshot.json"
 SHUTDOWN_GRACE_SECONDS: float = 5.0
 TELEMETRY_PORT: int = 9000
 DASHBOARD_REFRESH_SECONDS: float = 2.0
+# Tightened cadence used while the AI worker is mid-call, so the dashboard's
+# "Analyzing... (X.Xs)" elapsed counter ticks smoothly instead of jumping in
+# multi-second leaps. 0.5s ≈ "human-perceptible motion" without burning CPU
+# on render churn the operator can't read anyway.
+ANALYZING_REFRESH_SECONDS: float = 0.5
 HEARTBEAT_STALE_SECONDS: float = 3.0
 
 # Per-node queue length that, when strictly exceeded, is treated as a DDoS
@@ -52,7 +57,7 @@ CONTROL_PLANE_NODE_ID: int = 0
 
 # Default Gemini model used by the AI worker. Kept here so the only place to
 # bump versions is the control plane configuration block.
-GEMINI_MODEL: str = "gemini-2.5-flash"
+GEMINI_MODEL: str = "gemini-2.5-flash-lite"
 
 # ANSI escapes. Used for clear-screen and stale-cell highlighting in the
 # dashboard. Auto-suppressed when stdout is not a TTY.
@@ -704,13 +709,31 @@ def main() -> int:
 
         while not _shutdown_event.is_set():
             render_dashboard(topology, nodes, telemetry, detector)
-            # Default cadence; tightened while the AI worker is running so the
-            # operator can watch the "Analyzing..." elapsed counter tick.
+            # Priority: analyzing > fresh anomaly > steady-state.
+            # `consume_fresh()` is called UNCONDITIONALLY because it has a
+            # side effect — it clears detector._fresh, and skipping it would
+            # leave the flag set forever and re-trigger the banner pause on
+            # every iteration. We capture the result but only honor it when
+            # the AI isn't actively running.
+            #
+            # Why analyzing wins: when an attack first fires, the AI worker is
+            # spawned synchronously inside detector.check(), so the very next
+            # iteration sees BOTH is_fresh=True AND ai_state="analyzing". The
+            # old code took the 5-second `ANOMALY_PAUSE_SECONDS` branch, which
+            # froze the main thread and made the elapsed timer leap from 0.0s
+            # to 5.0s on the next render. Choosing the fast tick instead keeps
+            # the banner visible (it's re-rendered every 0.5s anyway, with the
+            # live elapsed counter) and gives the operator smooth motion.
+            #
+            # ANOMALY_PAUSE_SECONDS still fires in the edge case where the AI
+            # worker failed instantly (e.g. missing GEMINI_API_KEY), so the
+            # operator can read the error banner before it scrolls.
             ai_state = detector.ai_status_for_display()["state"]
-            if detector.consume_fresh():
+            is_fresh = detector.consume_fresh()
+            if ai_state == "analyzing":
+                pause = ANALYZING_REFRESH_SECONDS
+            elif is_fresh:
                 pause = ANOMALY_PAUSE_SECONDS
-            elif ai_state == "analyzing":
-                pause = 1.0
             else:
                 pause = DASHBOARD_REFRESH_SECONDS
             _shutdown_event.wait(pause)

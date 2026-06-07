@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,8 +37,16 @@ from pydantic import BaseModel, Field
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 DEFAULT_SNAPSHOT: Path = REPO_ROOT / "logs" / "anomaly_snapshot.json"
-DEFAULT_MODEL: str = "gemini-2.5-flash"
-FALLBACK_MODEL: str = "gemini-1.5-flash"
+DEFAULT_MODEL: str = "gemini-2.5-flash-lite"
+FALLBACK_MODEL: str = "gemini-2.5-flash-lite"
+
+# Delay inserted between the Analyzer and Strategist API calls. Both run
+# back-to-back in microseconds; the free-tier token-bucket on Google AI Studio
+# treats that as a burst and immediately fires 429 RESOURCE_EXHAUSTED. A small
+# jitter spreads the two calls across separate bucket windows and reliably
+# clears the limit. Tunable via env var for paid-tier deployments where the
+# throttle is unnecessary overhead.
+BURST_DELAY_SECONDS: float = float(os.environ.get("NETSHIELD_BURST_DELAY", "3.0"))
 
 
 class MitigationStrategy(BaseModel):
@@ -151,7 +160,11 @@ def run_analyzer(
         response = client.models.generate_content(
             model=model, contents=user_payload, config=config
         )
-    except genai_errors.ServerError as exc:
+    except genai_errors.APIError as exc:
+        # APIError is the common base of ServerError (5xx) and ClientError
+        # (4xx), so this single handler covers both 503 UNAVAILABLE and 429
+        # RESOURCE_EXHAUSTED. The narrower ServerError-only catch we had
+        # before let 429s crash the worker outright.
         print(
             f"[orchestrator] WARNING: {model} unavailable ({exc}) "
             f"— retrying with {FALLBACK_MODEL}",
@@ -169,6 +182,15 @@ def run_strategist(
     snapshot: dict[str, Any],
     analysis: str,
 ) -> MitigationStrategy:
+    # Burst throttle. Placed at the top of run_strategist (rather than in the
+    # callers) so EVERY caller — standalone CLI in main() and the control
+    # plane's _ai_worker thread — gets the same protection without each
+    # having to remember to sleep. The Analyzer call has already returned by
+    # the time we're here, so this delay sits exactly between the two API
+    # calls, which is what the token bucket needs to see.
+    if BURST_DELAY_SECONDS > 0:
+        time.sleep(BURST_DELAY_SECONDS)
+
     user_payload = (
         "ANALYZER REASONING:\n"
         f"{analysis}\n\n"
@@ -184,7 +206,9 @@ def run_strategist(
         response = client.models.generate_content(
             model=model, contents=user_payload, config=config
         )
-    except genai_errors.ServerError as exc:
+    except genai_errors.APIError as exc:
+        # See run_analyzer — APIError covers both 5xx ServerError and 4xx
+        # ClientError (incl. 429 RESOURCE_EXHAUSTED).
         print(
             f"[orchestrator] WARNING: {model} unavailable ({exc}) "
             f"— retrying with {FALLBACK_MODEL}",
