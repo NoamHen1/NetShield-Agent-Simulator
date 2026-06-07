@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,6 +50,11 @@ struct NodeState {
     std::uint64_t delivered = 0;      // packets terminated at this node
     std::uint64_t forwarded = 0;      // packets handed off to a next hop
     std::uint64_t dropped   = 0;      // packets discarded (no route, malformed, etc.)
+
+    // Dynamic ACL: source_node_ids whose DATA traffic we silently drop. Mutated
+    // only by CONTROL packets from the Python control plane; read O(1) on the
+    // hot path. Guarded by `mtx` like everything else in NodeState.
+    std::unordered_set<int> blocked_sources;
 };
 
 void telemetry_loop(int node_id, int telemetry_port, NodeState& state) {
@@ -244,6 +250,54 @@ int main(int argc, char* argv[]) {
         const std::uint32_t pid  = ntohl(wire->packet_id);
         const std::uint16_t src  = ntohs(wire->source_node_id);
         const std::uint16_t dest = ntohs(wire->dest_node_id);
+
+        // -- CONTROL plane: parse policy update before any data-path work. ----
+        // CONTROL packets carry plain-ASCII policy commands from the Python
+        // control plane, e.g. "BLOCK:1" → add source node 1 to the ACL. Kept
+        // simple-by-design: the channel is loopback-only and the data plane
+        // never originates CONTROL itself.
+        if (wire->type == static_cast<std::uint8_t>(PacketType::CONTROL)) {
+            const std::uint16_t plen = ntohs(wire->payload_len);
+            if (plen == 0 || plen > netshield::PAYLOAD_SIZE) {
+                std::fprintf(stderr,
+                             "[node %d] CONTROL id=%u: bad payload_len=%u\n",
+                             node_id, pid, plen);
+                continue;
+            }
+            // Null-terminated copy so sscanf is safe — payload on the wire is
+            // not guaranteed to be terminated.
+            char body[netshield::PAYLOAD_SIZE + 1] = {0};
+            std::memcpy(body, wire->payload, plen);
+
+            int block_id = -1;
+            if (std::sscanf(body, "BLOCK:%d", &block_id) == 1 && block_id > 0) {
+                {
+                    std::lock_guard<std::mutex> lock(state.mtx);
+                    state.blocked_sources.insert(block_id);
+                }
+                std::printf(
+                    "[node %d] ENFORCING FIREWALL: Dropping all traffic from node %d\n",
+                    node_id, block_id);
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr,
+                             "[node %d] CONTROL id=%u: unrecognized payload \"%s\"\n",
+                             node_id, pid, body);
+            }
+            continue;
+        }
+
+        // -- ACL gate on the DATA path. ----------------------------------------
+        // O(1) hashset lookup under a brief lock. Performed BEFORE both
+        // delivery and forwarding so a blocked source cannot transit this node
+        // by either path. Silent drop — by design, attackers learn nothing.
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            if (state.blocked_sources.count(static_cast<int>(src)) != 0) {
+                ++state.dropped;
+                continue;
+            }
+        }
 
         if (static_cast<int>(dest) == node_id) {
             Packet pkt{};
