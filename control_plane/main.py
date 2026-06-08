@@ -18,7 +18,15 @@ from pathlib import Path
 from types import FrameType
 from typing import IO, Any
 
+from dotenv import load_dotenv
+
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+
+# Load project-scoped secrets (GEMINI_API_KEY etc.) from .env at import time.
+# Explicit path avoids depending on the caller's CWD — `make run` from the
+# project root and `python control_plane/main.py` from elsewhere both work.
+# No-op if .env is missing, so manual `export` still works as a fallback.
+load_dotenv(REPO_ROOT / ".env")
 NODE_BINARY: Path = REPO_ROOT / "bin" / "node"
 TOPOLOGY_PATH: Path = REPO_ROOT / "config" / "topology.json"
 LOG_DIR: Path = Path("/tmp/netshield")

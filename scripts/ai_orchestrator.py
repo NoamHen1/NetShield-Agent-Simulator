@@ -30,12 +30,19 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+
+# Load project-scoped secrets from .env at the repo root. Mirrors the same
+# behavior in control_plane/main.py so that running this orchestrator
+# directly (e.g. `make ai`) also picks up GEMINI_API_KEY without manual
+# `export`. No-op if .env is missing.
+load_dotenv(REPO_ROOT / ".env")
 DEFAULT_SNAPSHOT: Path = REPO_ROOT / "logs" / "anomaly_snapshot.json"
 DEFAULT_MODEL: str = "gemini-2.5-flash-lite"
 FALLBACK_MODEL: str = "gemini-2.5-flash-lite"
