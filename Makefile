@@ -5,6 +5,7 @@
 #   make install                      # create venv + install Python deps
 #   make run                          # launch control plane (needs GEMINI_API_KEY)
 #   make ddos 1 8                     # inject a flood (attacker=1, target=8)
+#   make traffic                      # generate benign background traffic
 #   make ai                           # run orchestrator against latest snapshot
 #   make smoke                        # end-to-end smoke test
 #   make test                         # routing unit test
@@ -60,7 +61,7 @@ endif
 ATTACKER   ?= 1
 TARGET     ?= 8
 
-.PHONY: all build install deps venv run ddos ai \
+.PHONY: all build install deps venv run ddos traffic ai \
         smoke test clean clean-logs distclean help
 
 .DEFAULT_GOAL := all
@@ -99,6 +100,9 @@ run: $(NODE_BIN) $(INSTALL_STAMP)  ## Launch the control plane (Ctrl+C to stop)
 
 ddos: $(INSTALL_STAMP)  ## Run DDoS flood: `make ddos <attacker> <target>`
 	$(VENV_PY) $(SCRIPT_DIR)/ddos.py --attacker $(ATTACKER) --target $(TARGET)
+
+traffic: $(INSTALL_STAMP)  ## Generate benign background traffic between edge nodes
+	$(VENV_PY) $(SCRIPT_DIR)/benign_traffic.py
 
 ai: $(INSTALL_STAMP)  ## Run AI orchestrator against logs/anomaly_snapshot.json
 	$(VENV_PY) $(SCRIPT_DIR)/ai_orchestrator.py
